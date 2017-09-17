@@ -100,6 +100,21 @@ describe("Linter", () => {
                 linter.verify(code, config, filename, true);
             }, "Intentional error.");
         });
+
+        it("has all the `parent` properties on nodes when the rule listeners are created", () => {
+            linter.defineRule("checker", context => {
+                const ast = context.getSourceCode().ast;
+
+                assert.strictEqual(ast.body[0].parent, ast);
+                assert.strictEqual(ast.body[0].expression.parent, ast.body[0]);
+                assert.strictEqual(ast.body[0].expression.left.parent, ast.body[0].expression);
+                assert.strictEqual(ast.body[0].expression.right.parent, ast.body[0].expression);
+
+                return {};
+            });
+
+            linter.verify("foo + bar", { rules: { checker: "error" } });
+        });
     });
 
     describe("context.getSourceLines()", () => {
@@ -432,43 +447,6 @@ describe("Linter", () => {
             linter.verify(code, config);
             assert(spy.calledOnce);
         });
-
-        it("should attach the node's parent", () => {
-            const config = { rules: { checker: "error" } };
-            const spy = sandbox.spy(context => {
-                const node = context.getNodeByRangeIndex(14);
-
-                assert.property(node, "parent");
-                assert.equal(node.parent.type, "VariableDeclarator");
-                return {};
-            });
-
-            linter.defineRule("checker", spy);
-            linter.verify(code, config);
-            assert(spy.calledOnce);
-        });
-
-        it("should not modify the node when attaching the parent", () => {
-            const config = { rules: { checker: "error" } };
-            const spy = sandbox.spy(context => {
-                const node1 = context.getNodeByRangeIndex(10);
-
-                assert.equal(node1.type, "VariableDeclarator");
-
-                const node2 = context.getNodeByRangeIndex(4);
-
-                assert.equal(node2.type, "Identifier");
-                assert.property(node2, "parent");
-                assert.equal(node2.parent.type, "VariableDeclarator");
-                assert.notProperty(node2.parent, "parent");
-                return {};
-            });
-
-            linter.defineRule("checker", spy);
-            linter.verify(code, config);
-            assert(spy.calledOnce);
-        });
-
     });
 
 
@@ -3586,6 +3564,136 @@ describe("Linter", () => {
 
                 assert.isTrue(linter1.environments.get("mock-env"), "mock env is present");
                 assert.isNull(linter2.environments.get("mock-env"), "mock env is not present");
+            });
+        });
+    });
+
+    describe("processors", () => {
+        beforeEach(() => {
+
+            // A rule that always reports the AST with a message equal to the source text
+            linter.defineRule("report-original-text", context => ({
+                Program(ast) {
+                    context.report({ node: ast, message: context.getSourceCode().text });
+                }
+            }));
+        });
+
+        describe("preprocessors", () => {
+            it("should apply a preprocessor to the code, and lint each code sample separately", () => {
+                const code = "foo bar baz";
+                const problems = linter.verify(
+                    code,
+                    { rules: { "report-original-text": "error" } },
+                    {
+
+                        // Apply a preprocessor that splits the source text into spaces and lints each word individually
+                        preprocess(input) {
+                            assert.strictEqual(input, code);
+                            assert.strictEqual(arguments.length, 1);
+                            return input.split(" ");
+                        }
+                    }
+                );
+
+                assert.strictEqual(problems.length, 3);
+                assert.deepEqual(problems.map(problem => problem.message), ["foo", "bar", "baz"]);
+            });
+        });
+
+        describe("postprocessors", () => {
+            it("should apply a postprocessor to the reported messages", () => {
+                const code = "foo bar baz";
+
+                const problems = linter.verify(
+                    code,
+                    { rules: { "report-original-text": "error" } },
+                    {
+                        preprocess: input => input.split(" "),
+
+                        /*
+                         * Apply a postprocessor that updates the locations of the reported problems
+                         * to make sure they correspond to the locations in the original text.
+                         */
+                        postprocess(problemLists) {
+                            assert.strictEqual(problemLists.length, 3);
+                            assert.strictEqual(arguments.length, 1);
+
+                            problemLists.forEach(problemList => assert.strictEqual(problemList.length, 1));
+                            return problemLists.reduce(
+                                (combinedList, problemList, index) =>
+                                    combinedList.concat(
+                                        problemList.map(
+                                            problem =>
+                                                Object.assign(
+                                                    {},
+                                                    problem,
+                                                    {
+                                                        message: problem.message.toUpperCase(),
+                                                        column: problem.column + index * 4
+                                                    }
+                                                )
+                                        )
+                                    ),
+                                []
+                            );
+                        }
+                    }
+                );
+
+                assert.strictEqual(problems.length, 3);
+                assert.deepEqual(problems.map(problem => problem.message), ["FOO", "BAR", "BAZ"]);
+                assert.deepEqual(problems.map(problem => problem.column), [1, 5, 9]);
+            });
+
+            it("should use postprocessed problem ranges when applying autofixes", () => {
+                const code = "foo bar baz";
+
+                linter.defineRule("capitalize-identifiers", context => ({
+                    Identifier(node) {
+                        if (node.name !== node.name.toUpperCase()) {
+                            context.report({
+                                node,
+                                message: "Capitalize this identifier",
+                                fix: fixer => fixer.replaceText(node, node.name.toUpperCase())
+                            });
+                        }
+                    }
+                }));
+
+                const fixResult = linter.verifyAndFix(
+                    code,
+                    { rules: { "capitalize-identifiers": "error" } },
+                    {
+
+                        /*
+                         * Apply a postprocessor that updates the locations of autofixes
+                         * to make sure they correspond to locations in the original text.
+                         */
+                        preprocess: input => input.split(" "),
+                        postprocess(problemLists) {
+                            return problemLists.reduce(
+                                (combinedProblems, problemList, blockIndex) =>
+                                    combinedProblems.concat(
+                                        problemList.map(problem =>
+                                            Object.assign(problem, {
+                                                fix: {
+                                                    text: problem.fix.text,
+                                                    range: problem.fix.range.map(
+                                                        rangeIndex => rangeIndex + blockIndex * 4
+                                                    )
+                                                }
+                                            }))
+                                    ),
+                                []
+                            );
+                        }
+                    }
+                );
+
+                assert.strictEqual(fixResult.fixed, true);
+                assert.strictEqual(fixResult.messages.length, 0);
+                assert.strictEqual(fixResult.output, "FOO BAR BAZ");
             });
         });
     });
